@@ -1,9 +1,13 @@
 #!/bin/bash
 
+# v0.3
+
+# Adds data to the log file
 log() {
     printf "$date_$time\t $@" | tee -a "$log_file"
 }
 
+# Establishes script variables
 set_var() {
     ## Script Variables
     time=$(date +%T)
@@ -27,6 +31,7 @@ set_var() {
     conf_dir="$sysreport_dir/config"
 }
 
+# Sets up script directories and files
 script_setup() {
     # Sets variables
     set_var
@@ -36,6 +41,8 @@ script_setup() {
       print_and_cat_logs
       exit
     fi
+
+    verify_launch_daemon
 
     # Sets the processes
     if [[ -f $conf_file ]]; then
@@ -63,23 +70,53 @@ script_setup() {
     done
 }
 
-uninstall() {
-  if [ "$EUID" -ne 0 ]; then
-    echo "Must run as root to uninstall"
+# Verifys launch daemon
+verify_launch_daemon() {
+  if [[ ! -f "/Library/LaunchDaemons/com.leadingreach.sysreport.plist" ]]; then
+    # Create the launch daemon plist file
+    echo "<?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>com.leadingreach.sysreport</string>
+        <key>Program</key>
+        <string>/usr/local/bin/sysreport</string>
+        <key>StartInterval</key>
+        <integer>60</integer>
+        <key>RunAtLoad</key>
+        <true/>
+    </dict>
+    </plist>" > "/Library/LaunchDaemons/com.leadingreach.sysreport.plist"
+    # Start the launch daemon
+    launchctl load "/Library/LaunchDaemons/com.leadingreach.sysreport.plist"
   else
-    launchctl unload /Library/LaunchDaemons/com.leadingreach.sysreport.plist
-    rm /Library/LaunchDaemons/com.leadingreach.sysreport.plist
-    rm -rf "$sysreport_dir"
-    rm /usr/local/bin/sysreport
-    exit
+    # Check if the launch daemon is properly configured
+    launchctl list | grep "com.leadingreach.sysreport" &>/dev/null
+    if [[ $? -ne 0 ]]; then
+      # Start the launch daemon
+      launchctl load "/Library/LaunchDaemons/com.leadingreach.sysreport.plist" &>/dev/null
+    fi
   fi
 }
 
+# Uninstalls sysreport
+uninstall() {
+  script_setup
+  launchctl unload /Library/LaunchDaemons/com.leadingreach.sysreport.plist
+  rm /Library/LaunchDaemons/com.leadingreach.sysreport.plist
+  rm -rf "$sysreport_dir"
+  rm /usr/local/bin/sysreport
+  exit
+}
+
+# Deletes logs after 30 days
 delete_logs() {
 	# Find all .log files older than 30 days
 	find $sysreport_dir -type f -name "*.log" -mtime +30 -print0 | xargs -0 rm -f
 }
 
+# Checks the status of the system cpu and memory
 cpu_check() {
     # Check CPU load
     # cpu_load=`top -l 1 | awk '/CPU usage/ {print $3}' | sed 's/%//'` > 4.12
@@ -96,16 +133,16 @@ cpu_check() {
     if [[ $cpu_system_load -gt 50 ]] || [[ $cpu_user_load -gt 50 ]]; then
         cpu_status="high"
     else
-        cpu_status="normal"
+        cpu_status="norm"
     fi
 
     if [[ $mem_system_load -gt 8 ]] || [[ $mem_swap_load -gt 4096 ]]; then
         mem_status="high"
     else
-        mem_status="normal"
+        mem_status="norm"
     fi
 
-    log "CPU load is $cpu_status\tCPU System Load: $cpu_system_load percent\tCPU User Load: $cpu_user_load percent\t|\tMemory useage is $mem_status\tMemory System Load: $mem_system_load GB\tSwap Load: $mem_swap_load MB\t\n"
+    log "CPU Load: $cpu_status - Sys: $cpu_system_load%%  User: $cpu_user_load%%  |  Mem Load: $mem_status - Sys: "$mem_system_load"GB  Swap: "$mem_swap_load"MB\n"
 
     if [[ $cpu_status == "high" ]] || [[ $mem_status == "high" ]]; then
         cpu_report
@@ -113,6 +150,7 @@ cpu_check() {
     fi
 }
 
+# Generates CPU reporting information
 cpu_report() {
     cpu_report="$(printf "USER:\t\t\tPID:\t\tCPU:\t\tMEM:\t\tSTART:\t\tTIME:\t\tCOMMAND:\n"
   ps aux | sort -nrk 3,3 | awk '{printf("%-20s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\n", $1, $2, $3, $4, $9, $10, $11, $12)}')"
@@ -121,15 +159,7 @@ cpu_report() {
     echo "$cpu_report" > $log_snapshot
 }
 
-process_report() {
-  if [[ -z $cpu_report ]]; then
-      cpu_report
-  fi
-
-  # Use awk to extract the columns and join them with commas
-  echo "$cpu_report" | tail -n +2 | grep "$process_name" | awk '{print "'"$time"'\t", $0}' >> "$process_file".log
-}
-
+# Checks the status of the process
 process_check() {
     # Checks if there is a specific process to monitor
     if [[ ! -z $process ]]; then
@@ -147,10 +177,22 @@ process_check() {
     fi
 }
 
+# Generates process reporting information
+process_report() {
+  if [[ -z $cpu_report ]]; then
+      cpu_report
+  fi
+
+  # Use awk to extract the columns and join them with commas
+  echo "$cpu_report" | tail -n +2 | grep "$process_name" | awk '{print "'"$time"'\t", $0}' >> "$process_file".log
+}
+
+# Adds proccess to be monitored
 process_add() {
   echo "$process_new" >> $conf_file
 }
 
+# Shows sysreport logs
 print_and_cat_logs() {
   while true; do
     i=1
@@ -170,18 +212,20 @@ print_and_cat_logs() {
     fi
   done
   file=$(find $log_dir -maxdepth 1 -type f -exec basename {} \; | sed -n "${file_num}p")
-  nl "$log_dir/$file" | grep "high"
+  grep "high" "$log_dir/$file" | nl -s ': '
   date=$(echo $file | awk -F "_" '{print $1}')
-  read -p "Enter a line number: " line_num
+  read -p "Enter a log number: " line_num
   if [[ $line_num =~ ^[0-9]+$ ]]; then
     time=$(awk "NR==$line_num" "$log_dir/$file" | awk '{print $1}')
     snapshot_file=$(find $log_snapshot_dir -type f -name "${date}_${time}_sysreport-snapshot.log")
-    cat "$snapshot_file"
+    printf "$snapshot_file\n"
+    vim "$snapshot_file"
   else
     echo "Invalid input. Please enter a valid line number."
   fi
 }
 
+# Checks for sysreport flags
 flag_check() {
     while getopts ":ld:p:u" opt; do
     case $opt in
