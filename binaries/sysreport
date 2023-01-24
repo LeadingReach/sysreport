@@ -1,0 +1,213 @@
+#!/bin/bash
+
+log() {
+    printf "$date_$time\t $@" | tee -a "$log_file"
+}
+
+set_var() {
+    ## Script Variables
+    time=$(date +%T)
+
+    # Get current time and date
+    date=$(date +%m-%d-%y)
+
+    #  Sets working directory
+    if [[ -z "$sysreport_dir" ]]; then
+        sysreport_dir="/opt/sysreport"
+    fi
+
+    #  Set the path to log directories
+    log_dir="$sysreport_dir/log"
+    log_file="$sysreport_dir/log/${date}_sysreport.log"
+    log_snapshot_dir="$sysreport_dir/log/snapshots"
+    log_snapshot="$sysreport_dir/log/snapshots/${date}_${time}_sysreport-snapshot.log"
+
+    #  Set the path to sysreport files
+    conf_file="$sysreport_dir/config/sysreport.conf"
+    conf_dir="$sysreport_dir/config"
+}
+
+script_setup() {
+    # Sets variables
+    set_var
+
+    if [ "$EUID" -ne 0 ]; then
+      set_var
+      print_and_cat_logs
+      exit
+    fi
+
+    # Sets the processes
+    if [[ -f $conf_file ]]; then
+      IFS=$'\n' read -d '' -r -a process < $conf_file
+    fi
+
+    #  Creates sysreport directories
+    dirs=("$sysreport_dir" "$log_dir" "$log_snapshot_dir")
+    for dir in "${dirs[@]}"
+    do
+        if [ ! -d "$dir" ]; then
+            mkdir -p "$dir"
+            echo "Directory $dir created."
+        fi
+    done
+
+    #  Creates sysreport files
+    files=("$log_file")
+    for file in "${files[@]}"
+    do
+        if [ ! -f "$file" ]; then
+            touch "$file"
+            echo "log $file created."
+        fi
+    done
+}
+
+uninstall() {
+  if [ "$EUID" -ne 0 ]; then
+    echo "Must run as root to uninstall"
+  else
+    launchctl unload /Library/LaunchDaemons/com.leadingreach.sysreport.plist
+    rm /Library/LaunchDaemons/com.leadingreach.sysreport.plist
+    rm -rf "$sysreport_dir"
+    rm /usr/local/bin/sysreport
+    exit
+  fi
+}
+
+delete_logs() {
+	# Find all .log files older than 30 days
+	find $sysreport_dir -type f -name "*.log" -mtime +30 -print0 | xargs -0 rm -f
+}
+
+cpu_check() {
+    # Check CPU load
+    # cpu_load=`top -l 1 | awk '/CPU usage/ {print $3}' | sed 's/%//'` > 4.12
+    cpu_total_load=$(top -l 2 | grep -E "^CPU" | head -n 1 | awk '{print $1, $2, $3, $4, $5, $6, $7, $8, $9}')
+    cpu_system_load=$(echo "${cpu_total_load}" | awk '{print $5}' | awk '{print int($1+0.5)}')
+    cpu_user_load=$(echo "${cpu_total_load}" | awk '{print $3}' | awk '{print int($1+0.5)}')
+
+    # Check Memory load
+    mem_total_load=$(echo "Memory usage: $(sysctl -n hw.memsize | awk '{print $0/1024/1024/1024"GB"}') total, $(ps -A -o rss | awk '{sum+=$1} END {print sum/1024/1024"GB"}') used, $(sysctl -n vm.swapusage | awk '{print $3}') swap")
+    mem_system_load=$(echo "${mem_total_load}" | awk '{print $5}' | awk '{print int($1+0.5)}')
+    mem_swap_load=$(echo "${mem_total_load}" | awk '{print $7}' | awk '{print int($1+0.5)}')
+    
+    # Check if CPU load is above 50%
+    if [[ $cpu_system_load -gt 50 ]] || [[ $cpu_user_load -gt 50 ]]; then
+        cpu_status="high"
+    else
+        cpu_status="normal"
+    fi
+
+    if [[ $mem_system_load -gt 8 ]] || [[ $mem_swap_load -gt 4096 ]]; then
+        mem_status="high"
+    else
+        mem_status="normal"
+    fi
+
+    log "CPU load is $cpu_status\tCPU System Load: $cpu_system_load percent\tCPU User Load: $cpu_user_load percent\t|\tMemory useage is $mem_status\tMemory System Load: $mem_system_load GB\tSwap Load: $mem_swap_load MB\t\n"
+
+    if [[ $cpu_status == "high" ]] || [[ $mem_status == "high" ]]; then
+        cpu_report
+        process_check
+    fi
+}
+
+cpu_report() {
+    cpu_report="$(printf "USER:\t\t\tPID:\t\tCPU:\t\tMEM:\t\tSTART:\t\tTIME:\t\tCOMMAND:\n"
+  ps aux | sort -nrk 3,3 | awk '{printf("%-20s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\t%-10s\n", $1, $2, $3, $4, $9, $10, $11, $12)}')"
+
+    # Exporets the enite report
+    echo "$cpu_report" > $log_snapshot
+}
+
+process_report() {
+  if [[ -z $cpu_report ]]; then
+      cpu_report
+  fi
+
+  # Use awk to extract the columns and join them with commas
+  echo "$cpu_report" | tail -n +2 | grep "$process_name" | awk '{print "'"$time"'\t", $0}' >> "$process_file".log
+}
+
+process_check() {
+    # Checks if there is a specific process to monitor
+    if [[ ! -z $process ]]; then
+        for item in "${process[@]}"; do
+            process_name="$item"
+            process_dir="$sysreport_dir/$item"
+            process_file="$process_dir/${date}_${item}"
+
+            if [ ! -d "$process_dir" ]; then
+            mkdir -p "$process_dir"
+            echo "Directory $dir created."
+            fi
+            process_report "$item"
+        done
+    fi
+}
+
+process_add() {
+  echo "$process_new" >> $conf_file
+}
+
+print_and_cat_logs() {
+  while true; do
+    i=1
+    for file in $(find $log_dir -maxdepth 1 -type f); do
+      echo "File $i: $file"
+      i=$((i+1))
+    done
+    read -p "Enter a file number: " file_num
+    if [[ $file_num =~ ^[0-9]+$ ]]; then
+      if [ $file_num -gt 0 ] && [ $file_num -le $i ]; then
+          break
+      else
+        echo "Invalid input. Please enter a valid file number."
+      fi
+    else
+      echo "Invalid input. Please enter a valid file number."
+    fi
+  done
+  file=$(find $log_dir -maxdepth 1 -type f -exec basename {} \; | sed -n "${file_num}p")
+  nl "$log_dir/$file" | grep "high"
+  date=$(echo $file | awk -F "_" '{print $1}')
+  read -p "Enter a line number: " line_num
+  if [[ $line_num =~ ^[0-9]+$ ]]; then
+    time=$(awk "NR==$line_num" "$log_dir/$file" | awk '{print $1}')
+    snapshot_file=$(find $log_snapshot_dir -type f -name "${date}_${time}_sysreport-snapshot.log")
+    cat "$snapshot_file"
+  else
+    echo "Invalid input. Please enter a valid line number."
+  fi
+}
+
+flag_check() {
+    while getopts ":ld:p:u" opt; do
+    case $opt in
+        l)
+        set_var
+        print_and_cat_logs
+        exit
+        ;;
+        d)
+        sysreport_dir="$OPTARG"
+        script_setup
+        ;;
+        p)
+        process_new="$OPTARG"
+        script_setup
+        process_add
+        ;;
+        u)
+        uninstall
+        ;;
+    esac
+    done
+    shift $((OPTIND -1))
+}
+
+flag_check "$@"
+script_setup
+cpu_check
+delete_logs
