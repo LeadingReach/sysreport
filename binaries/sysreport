@@ -225,7 +225,7 @@ print_and_cat_logs() {
   fi
 }
 
-# Checks for sysreport flags
+# Checks for sysreport flag
 flag_check() {
     while getopts ":ld:p:u" opt; do
     case $opt in
